@@ -2,6 +2,12 @@ import ytdl from "@distube/ytdl-core";
 
 export const runtime = "nodejs";
 
+const REQUEST_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+
 function formatDuration(totalSeconds) {
   const sec = Math.max(0, Number(totalSeconds) || 0);
   const h = Math.floor(sec / 3600);
@@ -51,6 +57,103 @@ function isBotBlockedError(message) {
     text.includes("confirm you are not a bot") ||
     text.includes("sign in to confirm")
   );
+}
+
+function decodeEscapedText(value) {
+  return String(value || "")
+    .replace(/\\u0026/g, "&")
+    .replace(/\\u003c/g, "<")
+    .replace(/\\u003e/g, ">")
+    .replace(/\\n/g, " ")
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\")
+    .trim();
+}
+
+function extractInitialPlayerResponse(html) {
+  const marker = "var ytInitialPlayerResponse = ";
+  const idx = html.indexOf(marker);
+  if (idx === -1) return null;
+
+  const start = idx + marker.length;
+  const end = html.indexOf(";</script>", start);
+  if (end === -1) return null;
+
+  const jsonText = html.slice(start, end).trim();
+  try {
+    return JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+}
+
+function extractChaptersFromWatchHtml(html, durationSec) {
+  const chapterRegex = /"chapterRenderer":\{"title":\{"simpleText":"((?:\\.|[^"\\])*)"\}[\s\S]*?"timeRangeStartMillis":"(\d+)"/g;
+  const raw = [];
+  let match = chapterRegex.exec(html);
+
+  while (match) {
+    const title = decodeEscapedText(match[1]);
+    const startSec = Math.floor(Number(match[2]) / 1000);
+    if (title && Number.isFinite(startSec) && startSec >= 0) {
+      raw.push({ title, startSec });
+    }
+    match = chapterRegex.exec(html);
+  }
+
+  if (!raw.length) return [];
+
+  const deduped = [];
+  const seen = new Set();
+  for (const item of raw) {
+    const key = `${item.title}__${item.startSec}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      deduped.push(item);
+    }
+  }
+
+  deduped.sort((a, b) => a.startSec - b.startSec);
+  return deduped.map((ch, idx) => {
+    const nextStart = deduped[idx + 1]?.startSec;
+    const endSec = Number.isFinite(nextStart) ? Math.max(ch.startSec, nextStart - 1) : durationSec;
+    return { ...ch, endSec };
+  });
+}
+
+async function fetchWatchPageMetadata(videoId) {
+  const url = `https://www.youtube.com/watch?v=${videoId}&hl=en`;
+  const res = await fetch(url, {
+    headers: REQUEST_HEADERS,
+    cache: "no-store",
+  });
+
+  if (!res.ok) {
+    throw new Error("Failed to fetch watch page metadata");
+  }
+
+  const html = await res.text();
+  const playerResponse = extractInitialPlayerResponse(html);
+  const durationSec = Number(playerResponse?.videoDetails?.lengthSeconds || 0);
+  const chapters = extractChaptersFromWatchHtml(html, durationSec);
+
+  const title = playerResponse?.videoDetails?.title || "Unknown title";
+  const channelTitle = playerResponse?.videoDetails?.author || "Unknown channel";
+  const thumbnail = playerResponse?.videoDetails?.thumbnail?.thumbnails?.[0]?.url || null;
+
+  return {
+    title,
+    channelTitle,
+    thumbnail,
+    durationSec,
+    durationLabel: formatDuration(durationSec),
+    videoId,
+    isLongVideo: durationSec >= 3600,
+    hasCreatorTimeline: chapters.length > 0,
+    chapters,
+    warning:
+      "Primary metadata was blocked on this server. Loaded fallback metadata from watch page.",
+  };
 }
 
 async function fetchFallbackMetadata(videoId, ytLink) {
@@ -116,6 +219,13 @@ export async function POST(request) {
     } catch (innerError) {
       if (!isBotBlockedError(innerError?.message)) {
         throw innerError;
+      }
+
+      try {
+        const watchPageFallback = await fetchWatchPageMetadata(videoId);
+        return Response.json(watchPageFallback);
+      } catch {
+        // Final fallback below.
       }
 
       const fallback = await fetchFallbackMetadata(videoId, ytLink);

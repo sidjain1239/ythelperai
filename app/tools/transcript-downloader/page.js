@@ -3,6 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { Download, FileText, Loader } from "lucide-react";
+import { extractTranscriptTextClient } from "@/lib/client-transcript";
 
 export default function TranscriptDownloader() {
   const [videoUrl, setVideoUrl] = useState("");
@@ -132,14 +133,7 @@ export default function TranscriptDownloader() {
         };
       }
 
-      const res = await fetch("/api/transcript", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
+      const data = await extractTranscriptTextClient(payload);
 
       const transcript = data.transcript;
       let fileContent = transcript;

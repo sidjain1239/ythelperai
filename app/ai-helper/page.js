@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect } from 'react';
 import Link from 'next/link';
 import { Bot, BrainCircuit, Clapperboard, Languages, List, Loader, Plus, Send, Sparkles, TestTube, User, Youtube } from 'lucide-react';
+import { extractTranscriptTextClient } from '@/lib/client-transcript';
 
 export default function AIHelper() {
   const [videoUrl, setVideoUrl] = useState('');
@@ -132,14 +133,7 @@ export default function AIHelper() {
         };
       }
 
-      const res = await fetch('/api/transcript', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
+      const data = await extractTranscriptTextClient(payload);
 
       setTranscript(data.transcript);
       setMessages([]);
