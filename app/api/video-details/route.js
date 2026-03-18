@@ -1,6 +1,7 @@
 import ytdl from "@distube/ytdl-core";
 
 export const runtime = "nodejs";
+const TUBETEXT_ENDPOINT = "https://tubetext.vercel.app/youtube/transcript-with-timestamps";
 
 const REQUEST_HEADERS = {
   "User-Agent":
@@ -68,6 +69,55 @@ function decodeEscapedText(value) {
     .replace(/\\"/g, '"')
     .replace(/\\\\/g, "\\")
     .trim();
+}
+
+function parseTimestampToSeconds(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(?:(\d+):)?([0-5]?\d):([0-5]\d)$/);
+  if (!match) return null;
+
+  const h = Number(match[1] || 0);
+  const m = Number(match[2] || 0);
+  const s = Number(match[3] || 0);
+  return (h * 3600) + (m * 60) + s;
+}
+
+function extractChaptersFromDescription(description, durationSec) {
+  const lines = String(description || "").split(/\r?\n/);
+  const entries = lines
+    .map((line) => String(line || "").trim())
+    .map((line) => {
+      // Supports: "00:00 Intro", "1:12:30 Deep Dive", "00:00 - Intro"
+      const match = line.match(/^((?:(?:\d+):)?[0-5]?\d:[0-5]\d)\s*(?:[-|:])?\s+(.+)$/);
+      if (!match) return null;
+      const startSec = parseTimestampToSeconds(match[1]);
+      if (!Number.isFinite(startSec)) return null;
+      return { startSec, title: match[2].trim() };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.startSec - b.startSec);
+
+  if (!entries.length) return [];
+
+  const deduped = [];
+  const seen = new Set();
+  for (const item of entries) {
+    const key = `${item.startSec}__${item.title.toLowerCase()}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      deduped.push(item);
+    }
+  }
+
+  return deduped.map((ch, idx) => {
+    const nextStart = deduped[idx + 1]?.startSec;
+    const endSec = Number.isFinite(nextStart) ? Math.max(ch.startSec, nextStart - 1) : Math.max(ch.startSec, durationSec || ch.startSec);
+    return {
+      title: ch.title,
+      startSec: ch.startSec,
+      endSec,
+    };
+  });
 }
 
 function extractInitialPlayerResponse(html) {
@@ -179,6 +229,44 @@ async function fetchFallbackMetadata(videoId, ytLink) {
   };
 }
 
+async function fetchTubeTextMetadata(videoId) {
+  const url = `${TUBETEXT_ENDPOINT}?video_id=${encodeURIComponent(videoId)}`;
+  const res = await fetch(url, {
+    headers: REQUEST_HEADERS,
+    cache: "no-store",
+  });
+
+  if (!res.ok) {
+    throw new Error("Failed to fetch Tubetext metadata");
+  }
+
+  const payload = await res.json();
+  if (!payload?.success || !payload?.data) {
+    throw new Error("Tubetext metadata payload invalid");
+  }
+
+  const details = payload.data.details || {};
+  const title = details.title || "Unknown title";
+  const channelTitle = details.channel || "Unknown channel";
+  const description = details.description || "";
+
+  const chapters = extractChaptersFromDescription(description, 0);
+
+  return {
+    title,
+    channelTitle,
+    thumbnail: null,
+    durationSec: 0,
+    durationLabel: "Unknown",
+    videoId,
+    isLongVideo: false,
+    hasCreatorTimeline: chapters.length > 0,
+    chapters,
+    warning:
+      "Primary YouTube metadata was blocked on this server. Loaded fallback details via Tubetext.",
+  };
+}
+
 export async function POST(request) {
   try {
     const body = await request.json();
@@ -224,6 +312,13 @@ export async function POST(request) {
       try {
         const watchPageFallback = await fetchWatchPageMetadata(videoId);
         return Response.json(watchPageFallback);
+      } catch {
+        // Continue to next fallback.
+      }
+
+      try {
+        const tubeTextFallback = await fetchTubeTextMetadata(videoId);
+        return Response.json(tubeTextFallback);
       } catch {
         // Final fallback below.
       }

@@ -3,15 +3,68 @@ import ytdl from "@distube/ytdl-core";
 export const runtime = "nodejs";
 
 const YT_PLAYER_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+const TUBETEXT_ENDPOINT = "https://tubetext.vercel.app/youtube/transcript-with-timestamps";
 const WORD_LIMIT = 5000;
+const CACHE_TTL_MS = 5 * 60 * 1000;
+const RATE_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX = 30;
 const REQUEST_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   "Accept-Language": "en-US,en;q=0.9",
 };
 
+const transcriptCache = new Map();
+const rateLimitStore = new Map();
+
 function countWords(text) {
   return String(text).trim().split(/\s+/).filter(Boolean).length;
+}
+
+function getClientIp(request) {
+  const xForwardedFor = request.headers.get("x-forwarded-for");
+  if (xForwardedFor) {
+    return xForwardedFor.split(",")[0].trim();
+  }
+
+  return request.headers.get("x-real-ip") || "unknown";
+}
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const current = rateLimitStore.get(ip);
+
+  if (!current || now - current.windowStart >= RATE_WINDOW_MS) {
+    rateLimitStore.set(ip, { count: 1, windowStart: now });
+    return false;
+  }
+
+  if (current.count >= RATE_LIMIT_MAX) {
+    return true;
+  }
+
+  current.count += 1;
+  rateLimitStore.set(ip, current);
+  return false;
+}
+
+function getCachedTranscript(cacheKey) {
+  const value = transcriptCache.get(cacheKey);
+  if (!value) return null;
+
+  if (Date.now() > value.expiresAt) {
+    transcriptCache.delete(cacheKey);
+    return null;
+  }
+
+  return value.data;
+}
+
+function setCachedTranscript(cacheKey, data) {
+  transcriptCache.set(cacheKey, {
+    data,
+    expiresAt: Date.now() + CACHE_TTL_MS,
+  });
 }
 
 function normalizeRange(range) {
@@ -113,6 +166,23 @@ function pickCaptionTrack(tracks) {
 
   const firstManual = tracks.find((t) => !t.kind);
   return firstManual || tracks[0];
+}
+
+function pickCaptionTrackByLanguage(tracks, lang) {
+  if (!Array.isArray(tracks) || !tracks.length) return null;
+
+  const normalizedLang = String(lang || "").trim().toLowerCase();
+  if (!normalizedLang) {
+    return pickCaptionTrack(tracks);
+  }
+
+  const exact = tracks.find((t) => String(t.languageCode || "").toLowerCase() === normalizedLang);
+  if (exact) return exact;
+
+  const startsWith = tracks.find((t) => String(t.languageCode || "").toLowerCase().startsWith(normalizedLang));
+  if (startsWith) return startsWith;
+
+  return pickCaptionTrack(tracks);
 }
 
 async function fetchPlayerDataFromYoutubei(videoId) {
@@ -243,6 +313,119 @@ function toTranscriptSegments(events) {
     .filter(Boolean);
 }
 
+function toSecondsFromTimestampText(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(?:(\d+):)?([0-5]?\d):([0-5]\d)$/);
+  if (!match) return null;
+
+  const h = Number(match[1] || 0);
+  const m = Number(match[2] || 0);
+  const s = Number(match[3] || 0);
+  return (h * 3600) + (m * 60) + s;
+}
+
+function parseTubeTextLine(line) {
+  const text = String(line || "").trim();
+  if (!text) return null;
+
+  // Supports formats like "00:12 Intro", "1:02:13 - Segment"
+  const match = text.match(/^(?:(\d+):)?([0-5]?\d):([0-5]\d)\s*(?:[-|:])?\s*(.*)$/);
+  if (!match) {
+    return { text, offset: null };
+  }
+
+  const h = Number(match[1] || 0);
+  const m = Number(match[2] || 0);
+  const s = Number(match[3] || 0);
+  const body = String(match[4] || "").trim() || text;
+  const offset = ((h * 3600) + (m * 60) + s) * 1000;
+  return { text: body, offset };
+}
+
+function segmentsFromTubeTextEntries(entries) {
+  if (!Array.isArray(entries)) return [];
+
+  const parsed = entries
+    .map((item, idx) => {
+      if (typeof item === "string") {
+        const result = parseTubeTextLine(item);
+        if (!result) return null;
+        return {
+          text: result.text,
+          offset: Number.isFinite(result.offset) ? result.offset : idx * 4000,
+          duration: 0,
+        };
+      }
+
+      if (item && typeof item === "object") {
+        const text = String(item.text || item.value || item.line || "").trim();
+        if (!text) return null;
+
+        let offsetMs = null;
+        if (Number.isFinite(Number(item.offset))) {
+          offsetMs = Number(item.offset);
+        } else if (Number.isFinite(Number(item.start))) {
+          offsetMs = Number(item.start);
+        } else {
+          const timestampSec = toSecondsFromTimestampText(item.timestamp || item.time || "");
+          if (Number.isFinite(timestampSec)) {
+            offsetMs = timestampSec * 1000;
+          }
+        }
+
+        return {
+          text,
+          offset: Number.isFinite(offsetMs) ? offsetMs : idx * 4000,
+          duration: Number(item.duration ?? item.dur ?? 0) || 0,
+        };
+      }
+
+      return null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => Number(a.offset || 0) - Number(b.offset || 0));
+
+  return parsed;
+}
+
+async function fetchTranscriptFromTubeText(videoId, lang) {
+  const query = new URLSearchParams({ video_id: videoId });
+  if (lang) {
+    query.set("lang", String(lang));
+  }
+
+  const res = await fetch(`${TUBETEXT_ENDPOINT}?${query.toString()}`, {
+    headers: REQUEST_HEADERS,
+    cache: "no-store",
+  });
+
+  if (!res.ok) {
+    throw new Error(`Tubetext fallback request failed (${res.status}).`);
+  }
+
+  const data = await res.json();
+  if (!data?.success || !data?.data) {
+    throw new Error("Tubetext fallback returned invalid payload.");
+  }
+
+  const rawEntries = Array.isArray(data.data.transcript) ? data.data.transcript : [];
+  let transcript = segmentsFromTubeTextEntries(rawEntries);
+
+  if (!transcript.length && data?.data?.full_text) {
+    transcript = [{ text: String(data.data.full_text).trim(), offset: 0, duration: 0 }].filter((x) => x.text);
+  }
+
+  if (!transcript.length) {
+    throw new Error("Tubetext fallback has no transcript text.");
+  }
+
+  return {
+    transcript,
+    languageCode: String(lang || "unknown"),
+    details: data.data.details || null,
+  };
+}
+
 function decodeXmlText(value) {
   return String(value || "")
     .replace(/&#39;/g, "'")
@@ -282,7 +465,24 @@ function pickTimedtextTrack(tracks) {
   return firstManual || tracks[0];
 }
 
-async function fetchTimedtextTranscript(videoId) {
+function pickTimedtextTrackByLanguage(tracks, lang) {
+  if (!Array.isArray(tracks) || !tracks.length) return null;
+
+  const normalizedLang = String(lang || "").trim().toLowerCase();
+  if (!normalizedLang) {
+    return pickTimedtextTrack(tracks);
+  }
+
+  const exact = tracks.find((t) => String(t.lang_code || "").toLowerCase() === normalizedLang);
+  if (exact) return exact;
+
+  const startsWith = tracks.find((t) => String(t.lang_code || "").toLowerCase().startsWith(normalizedLang));
+  if (startsWith) return startsWith;
+
+  return pickTimedtextTrack(tracks);
+}
+
+async function fetchTimedtextTranscript(videoId, lang) {
   const listUrl = `https://video.google.com/timedtext?type=list&v=${encodeURIComponent(videoId)}`;
   const listRes = await fetch(listUrl, {
     headers: REQUEST_HEADERS,
@@ -296,7 +496,7 @@ async function fetchTimedtextTranscript(videoId) {
   const listXml = await listRes.text();
   const trackMatches = [...listXml.matchAll(/<track\s+([^>]+?)\s*\/?>(?:<\/track>)?/g)];
   const tracks = trackMatches.map((m) => parseXmlAttributes(m[1] || ""));
-  const selected = pickTimedtextTrack(tracks);
+  const selected = pickTimedtextTrackByLanguage(tracks, lang);
 
   if (!selected?.lang_code) {
     throw new Error("Captions are unavailable for this video.");
@@ -344,10 +544,13 @@ async function fetchTimedtextTranscript(videoId) {
     throw new Error("No transcript text found for this video.");
   }
 
-  return transcript;
+  return {
+    transcript,
+    languageCode: selected.lang_code || "unknown",
+  };
 }
 
-async function fetchTranscriptWithFallback(ytLink) {
+async function fetchTranscriptWithFallback(ytLink, lang) {
   const videoId = resolveVideoId(ytLink);
   if (!videoId) {
     throw new Error("Invalid YouTube URL.");
@@ -356,7 +559,7 @@ async function fetchTranscriptWithFallback(ytLink) {
   let primaryError = null;
   try {
     const tracks = await getCaptionTracks(videoId);
-    const selectedTrack = pickCaptionTrack(tracks);
+    const selectedTrack = pickCaptionTrackByLanguage(tracks, lang);
 
     if (!selectedTrack?.baseUrl) {
       throw new Error("Captions are unavailable for this video.");
@@ -369,28 +572,137 @@ async function fetchTranscriptWithFallback(ytLink) {
       throw new Error("No transcript text found for this video.");
     }
 
-    return { transcript, videoId };
+    return {
+      transcript,
+      videoId,
+      languageCode: selectedTrack.languageCode || "unknown",
+    };
   } catch (error) {
     primaryError = error;
   }
 
   try {
-    const transcript = await fetchTimedtextTranscript(videoId);
-    return { transcript, videoId };
+    const timedtextData = await fetchTimedtextTranscript(videoId, lang);
+    return {
+      transcript: timedtextData.transcript,
+      videoId,
+      languageCode: timedtextData.languageCode,
+    };
+  } catch {
+    // Continue to provider fallback.
+  }
+
+  try {
+    const tubeTextData = await fetchTranscriptFromTubeText(videoId, lang);
+    return {
+      transcript: tubeTextData.transcript,
+      videoId,
+      languageCode: tubeTextData.languageCode,
+      provider: "tubetext",
+    };
   } catch {
     throw primaryError || new Error("Failed to fetch transcript");
   }
 }
 
-export async function POST(request) {
+function mapTranscriptError(error) {
+  if (isBotBlockedError(error?.message)) {
+    return {
+      status: 403,
+      body: {
+        error:
+          "Sign in to confirm you're not a bot. YouTube blocked transcript access from this server. Please retry later or use another video.",
+      },
+    };
+  }
+
+  if (isTranscriptDisabledError(error?.message)) {
+    return {
+      status: 422,
+      body: {
+        error:
+          "Captions are unavailable for this video on the deployed server. Try another public-caption video or retry later.",
+      },
+    };
+  }
+
+  if (String(error?.message || "").toLowerCase().includes("invalid youtube url")) {
+    return {
+      status: 400,
+      body: { error: "Invalid YouTube video or videoId." },
+    };
+  }
+
+  return {
+    status: 500,
+    body: { error: error?.message || "Failed to fetch transcript" },
+  };
+}
+
+export async function GET(request) {
+  const ip = getClientIp(request);
+  if (isRateLimited(ip)) {
+    return Response.json(
+      { error: "Too many requests. Please try again in a minute." },
+      { status: 429 }
+    );
+  }
+
   try {
-    const { ytLink, mode = "full", startSec, endSec, ranges } = await request.json();
+    const { searchParams } = new URL(request.url);
+    const videoId = searchParams.get("videoId");
+    const lang = searchParams.get("lang") || "en";
+
+    if (!videoId) {
+      return Response.json({ error: "videoId is required." }, { status: 400 });
+    }
+
+    const ytLink = `https://www.youtube.com/watch?v=${videoId}`;
+    const cacheKey = `${videoId}:${lang}`;
+    const cached = getCachedTranscript(cacheKey);
+
+    if (cached) {
+      return Response.json({ ...cached, cached: true });
+    }
+
+    const { transcript, languageCode } = await fetchTranscriptWithFallback(ytLink, lang);
+    const combinedText = transcript.map((item) => item.text).join(" ").replace(/\s+/g, " ").trim();
+    const wordCount = countWords(combinedText);
+
+    const response = {
+      videoId,
+      languageCode,
+      transcript: combinedText,
+      segments: transcript.length,
+      wordCount,
+      cached: false,
+    };
+
+    setCachedTranscript(cacheKey, response);
+    return Response.json(response);
+  } catch (error) {
+    const mapped = mapTranscriptError(error);
+    return Response.json(mapped.body, { status: mapped.status });
+  }
+}
+
+export async function POST(request) {
+  const ip = getClientIp(request);
+  if (isRateLimited(ip)) {
+    return Response.json(
+      { error: "Too many requests. Please try again in a minute." },
+      { status: 429 }
+    );
+  }
+
+  try {
+    const { ytLink, mode = "full", startSec, endSec, ranges, lang = "en" } = await request.json();
 
     if (!ytLink) {
       return Response.json({ error: "ytLink is required." }, { status: 400 });
     }
 
-    const { transcript, videoId } = await fetchTranscriptWithFallback(ytLink);
+    const { transcript, videoId, languageCode } = await fetchTranscriptWithFallback(ytLink, lang);
     const filtered = filterByMode(transcript, mode, startSec, endSec, ranges);
     const combinedText = filtered.map((item) => item.text).join(" ").trim();
     const wordCount = countWords(combinedText);
@@ -412,31 +724,10 @@ export async function POST(request) {
       limit: WORD_LIMIT,
       segments: filtered.length,
       videoId,
+      languageCode,
     });
   } catch (error) {
-    if (isBotBlockedError(error?.message)) {
-      return Response.json(
-        {
-          error:
-            "YouTube blocked transcript access on this server (bot-check). Please try another video with public captions or try again later.",
-        },
-        { status: 403 }
-      );
-    }
-
-    if (isTranscriptDisabledError(error?.message)) {
-      return Response.json(
-        {
-          error:
-            "Captions are unavailable for this video on the deployed server. If it works locally, this is usually region/cookie/bot-policy related on hosting. Try another public-caption video or retry later.",
-        },
-        { status: 422 }
-      );
-    }
-
-    return Response.json(
-      { error: error?.message || "Failed to fetch transcript" },
-      { status: 500 }
-    );
+    const mapped = mapTranscriptError(error);
+    return Response.json(mapped.body, { status: mapped.status });
   }
 }
