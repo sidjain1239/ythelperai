@@ -265,6 +265,12 @@ export default function TranscriptDownloader() {
                   </button>
                 </div>
 
+                {videoInfo?.warning && (
+                  <div className="mb-3 rounded-lg border border-amber-400/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-200">
+                    {videoInfo.warning}
+                  </div>
+                )}
+
                 {videoInfo?.chapters?.length ? (
                   <div>
                     <p className="text-xs text-muted-foreground mb-2">Choose one or more chapters ({selectedChapterIndexes.length} selected).</p>

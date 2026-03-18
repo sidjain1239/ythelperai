@@ -44,6 +44,38 @@ function normalizeChapters(rawChapters, durationSec) {
   });
 }
 
+function isBotBlockedError(message) {
+  const text = String(message || "").toLowerCase();
+  return (
+    text.includes("confirm you're not a bot") ||
+    text.includes("confirm you are not a bot") ||
+    text.includes("sign in to confirm")
+  );
+}
+
+async function fetchFallbackMetadata(videoId, ytLink) {
+  const url = `https://www.youtube.com/oembed?url=${encodeURIComponent(ytLink)}&format=json`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) {
+    throw new Error("Failed to fetch fallback metadata");
+  }
+
+  const data = await res.json();
+  return {
+    title: data?.title || "Unknown title",
+    channelTitle: data?.author_name || "Unknown channel",
+    thumbnail: data?.thumbnail_url || null,
+    durationSec: 0,
+    durationLabel: "Unknown",
+    videoId,
+    isLongVideo: false,
+    hasCreatorTimeline: false,
+    chapters: [],
+    warning:
+      "YouTube blocked detailed metadata on this server. Basic details loaded; chapter/timeline metadata may be unavailable.",
+  };
+}
+
 export async function POST(request) {
   try {
     const body = await request.json();
@@ -58,27 +90,37 @@ export async function POST(request) {
     }
 
     const videoId = ytdl.getURLVideoID(ytLink);
-    const info = await ytdl.getBasicInfo(videoId);
-    const durationSec = Number(info?.videoDetails?.lengthSeconds || 0);
 
-    const rawChapters =
-      info?.videoDetails?.chapters ||
-      info?.player_response?.videoDetails?.chapters ||
-      [];
+    try {
+      const info = await ytdl.getBasicInfo(videoId);
+      const durationSec = Number(info?.videoDetails?.lengthSeconds || 0);
 
-    const chapters = normalizeChapters(rawChapters, durationSec);
+      const rawChapters =
+        info?.videoDetails?.chapters ||
+        info?.player_response?.videoDetails?.chapters ||
+        [];
 
-    return Response.json({
-      title: info?.videoDetails?.title || "Unknown title",
-      channelTitle: info?.videoDetails?.author?.name || info?.videoDetails?.ownerChannelName || "Unknown channel",
-      thumbnail: info?.videoDetails?.thumbnails?.[0]?.url || null,
-      durationSec,
-      durationLabel: formatDuration(durationSec),
-      videoId,
-      isLongVideo: durationSec >= 3600,
-      hasCreatorTimeline: chapters.length > 0,
-      chapters,
-    });
+      const chapters = normalizeChapters(rawChapters, durationSec);
+
+      return Response.json({
+        title: info?.videoDetails?.title || "Unknown title",
+        channelTitle: info?.videoDetails?.author?.name || info?.videoDetails?.ownerChannelName || "Unknown channel",
+        thumbnail: info?.videoDetails?.thumbnails?.[0]?.url || null,
+        durationSec,
+        durationLabel: formatDuration(durationSec),
+        videoId,
+        isLongVideo: durationSec >= 3600,
+        hasCreatorTimeline: chapters.length > 0,
+        chapters,
+      });
+    } catch (innerError) {
+      if (!isBotBlockedError(innerError?.message)) {
+        throw innerError;
+      }
+
+      const fallback = await fetchFallbackMetadata(videoId, ytLink);
+      return Response.json(fallback);
+    }
   } catch (error) {
     return Response.json(
       { error: error?.message || "Failed to fetch video details" },

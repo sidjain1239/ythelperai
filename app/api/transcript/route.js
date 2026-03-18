@@ -56,6 +56,15 @@ function filterByMode(transcript, mode, startSec, endSec, ranges) {
   throw new Error("Invalid mode. Use full, custom, or selected.");
 }
 
+function isBotBlockedError(message) {
+  const text = String(message || "").toLowerCase();
+  return (
+    text.includes("confirm you're not a bot") ||
+    text.includes("confirm you are not a bot") ||
+    text.includes("sign in to confirm")
+  );
+}
+
 export async function POST(request) {
   try {
     const { ytLink, mode = "full", startSec, endSec, ranges } = await request.json();
@@ -87,6 +96,16 @@ export async function POST(request) {
       segments: filtered.length,
     });
   } catch (error) {
+    if (isBotBlockedError(error?.message)) {
+      return Response.json(
+        {
+          error:
+            "YouTube blocked transcript access on this server (bot-check). Please try another video with public captions or try again later.",
+        },
+        { status: 403 }
+      );
+    }
+
     return Response.json(
       { error: error?.message || "Failed to fetch transcript" },
       { status: 500 }
