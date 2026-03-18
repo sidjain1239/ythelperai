@@ -1,4 +1,5 @@
 import ytdl from "@distube/ytdl-core";
+import { fetchTranscript } from "youtube-transcript";
 
 export const runtime = "nodejs";
 
@@ -556,6 +557,21 @@ async function fetchTranscriptWithFallback(ytLink, lang) {
     throw new Error("Invalid YouTube URL.");
   }
 
+  // Keep library-based extraction first because it is often the most stable in local dev.
+  try {
+    const transcript = await fetchTranscript(`https://www.youtube.com/watch?v=${videoId}`);
+    if (Array.isArray(transcript) && transcript.length) {
+      return {
+        transcript,
+        videoId,
+        languageCode: String(lang || "unknown"),
+        provider: "youtube-transcript",
+      };
+    }
+  } catch {
+    // Continue with custom endpoint fallbacks below.
+  }
+
   let primaryError = null;
   try {
     const tracks = await getCaptionTracks(videoId);
@@ -621,7 +637,7 @@ function mapTranscriptError(error) {
       status: 422,
       body: {
         error:
-          "Captions are unavailable for this video on the deployed server. Try another public-caption video or retry later.",
+          "Captions are unavailable for this video right now. Try another public-caption video or retry later.",
       },
     };
   }
@@ -696,7 +712,7 @@ export async function POST(request) {
   }
 
   try {
-    const { ytLink, mode = "full", startSec, endSec, ranges, lang = "en" } = await request.json();
+    const { ytLink, mode = "full", startSec, endSec, ranges, lang = "en", enforceLimit = true } = await request.json();
 
     if (!ytLink) {
       return Response.json({ error: "ytLink is required." }, { status: 400 });
@@ -707,7 +723,7 @@ export async function POST(request) {
     const combinedText = filtered.map((item) => item.text).join(" ").trim();
     const wordCount = countWords(combinedText);
 
-    if (wordCount > WORD_LIMIT) {
+    if (enforceLimit && wordCount > WORD_LIMIT) {
       return Response.json(
         {
           error: `This much can't be handled. Transcript has ${wordCount} words, limit is ${WORD_LIMIT}.`,

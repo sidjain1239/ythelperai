@@ -133,7 +133,10 @@ export default function TranscriptDownloader() {
         };
       }
 
-      const data = await extractTranscriptTextClient(payload);
+      const data = await extractTranscriptTextClient({
+        ...payload,
+        enforceLimit: false,
+      });
 
       const transcript = data.transcript;
       let fileContent = transcript;
